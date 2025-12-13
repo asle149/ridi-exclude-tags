@@ -1,0 +1,31 @@
+{
+    "name": "리디 제외 검색",
+    "version": "0.1.0",
+    "manifest_version": 3,
+  
+    "permissions": ["storage", "tabs"],
+    "host_permissions": ["https://ridibooks.com/keyword-finder/*"],
+  
+    "action": {
+      "default_popup": "popup.html",
+      "default_icon": "icons/icon.png"
+    },
+  
+    "background": {
+      "service_worker": "background.js"
+    },
+  
+    "content_scripts": [
+      {
+        "matches": [
+          "https://ridibooks.com/keyword-finder/bl*",
+          "https://ridibooks.com/keyword-finder/romance*",
+          "https://ridibooks.com/keyword-finder/fantasy*",
+          "https://ridibooks.com/keyword-finder/comic*"
+        ],
+        "js": ["content.js"],
+        "run_at": "document_start"
+      }
+    ]
+  }
+  

@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <title>리디 키워드 제외 검색</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header class="header">
+      <div class="title">리디 제외 검색</div>
+
+      <div class="headerRight">
+        <button id="applyNow" class="smallBtn">검색 반영</button>
+
+        <label class="toggle">
+          <input id="modeToggle" type="checkbox" />
+          <span class="toggleText">제외 모드</span>
+        </label>
+      </div>
+    </header>
+
+    <section class="section">
+      <div class="desc">제외 모드 체크한 뒤 태그를 클릭하면 제외 목록에 저장됩니다.</div>
+    </section>
+
+    <section class="section">
+      <h3 class="sectionTitle">포함 태그</h3>
+      <div id="includedList" class="chips"></div>
+    </section>
+
+    <section class="section">
+      <div class="sectionHeaderRow">
+        <h3 class="sectionTitle">제외 태그</h3>
+        <button id="clearExcluded" class="danger smallBtn" title="제외 태그 전체 삭제">전체 삭제</button>
+      </div>
+      <div id="excludedList" class="chips"></div>
+    </section>
+
+    <footer class="footer">
+      <div id="status" class="status"></div>
+    </footer>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
