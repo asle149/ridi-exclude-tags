@@ -77,6 +77,24 @@ module.exports = async function runApiTests() {
     assert.equal(env.calls.length, 15);
     assert.equal(env.maximum(), 2);
   });
+  await test("15페이지 캐시 뒤 30페이지 요청은 16페이지부터 이어 받음", async () => {
+    const env = setup({ total: 12802 });
+    assert.equal((await env.api.collectAll(variables)).loadedPages, 15);
+    const result = await env.api.collectAll(variables, { maxPages: 30 });
+    assert.equal(result.items.length, 6000);
+    assert.equal(result.loadedPages, 30);
+    assert.deepEqual(env.calls.slice(15).map((call) => call.pageLimitInput.page), Array.from({ length: 15 }, (_, i) => i + 16));
+    assert.equal(env.maximum(), 2);
+  });
+  await test("이어 받기 절대 상한 75페이지·동시 요청도 페이지 공유", async () => {
+    const env = setup({ total: 16000 });
+    const [first, second] = await Promise.all([env.api.collectAll(variables), env.api.collectAll(variables, { maxPages: 100 })]);
+    assert.equal(first.loadedPages, 15);
+    assert.equal(second.loadedPages, 75);
+    assert.equal(second.items.length, 15000);
+    assert.equal(second.truncated, true);
+    assert.equal(env.calls.length, 75);
+  });
   await test("0개 결과는 첫 페이지만 요청", async () => {
     const env = setup({ total: 0 });
     const result = await env.api.collectAll(variables);
