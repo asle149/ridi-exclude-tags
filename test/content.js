@@ -6,13 +6,16 @@ const source = fs.readFileSync(require.resolve("../content.js"), "utf8");
 const href = "https://ridibooks.com/keyword-finder/bl?set_id=15&tag_ids=1-포함&page=1";
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
-function setup({ excluded = { 2: "제외" }, deferred = false } = {}) {
+function setup({ excluded = { 2: "제외" }, deferred = false, withMarkdown = false } = {}) {
   let saved = { helperEnabled: true, excludeModeOn: false, excludedTagMap: excluded };
   let subscribe;
   let listener;
   let tick;
   let rendered;
   let unmounts = 0;
+  let markdownResolve;
+  const markdownRequests = [];
+  let panelCallbacks;
   const events = {};
   const timers = new Map();
   const requests = [];
@@ -20,11 +23,13 @@ function setup({ excluded = { 2: "제외" }, deferred = false } = {}) {
   const main = {};
   const section = {};
   const location = { href };
-  const result = { items: Array.from({ length: 45 }, (_, i) => ({ tags: [{ id: i < 3 ? 2 : 3 }] })), total: 45, truncated: false };
+  const result = { items: Array.from({ length: 45 }, (_, i) => ({ bookShell: { book: { id: i + 1 } }, tags: [{ id: i < 3 ? 2 : 3 }] })), total: 45, truncated: false };
   const window = {
     addEventListener(type, callback) { events[type] = callback; },
     RidiHelper: {
       core,
+      markdown: withMarkdown ? require("../src/markdown.js") : undefined,
+      panel: { create(callbacks) { panelCallbacks = callbacks; return { update() {} }; } },
       store: {
         read: async () => saved,
         subscribe(callback) { subscribe = callback; },
@@ -63,7 +68,8 @@ function setup({ excluded = { 2: "제외" }, deferred = false } = {}) {
       ] } } } }) }),
       addEventListener(type, callback) { events[type] = callback; },
     },
-    chrome: { runtime: { onMessage: { addListener(callback) { listener = callback; } } } },
+    chrome: { runtime: { onMessage: { addListener(callback) { listener = callback; } },
+      sendMessage(message) { markdownRequests.push(message); return new Promise((resolve) => { markdownResolve = resolve; }); } } },
     MutationObserver: class { observe() {} disconnect() {} },
     setInterval(callback, ms) { assert.equal(ms, 300); tick = callback; },
     setTimeout(callback, ms) { const id = {}; timers.set(id, { callback, ms }); return id; },
@@ -71,7 +77,8 @@ function setup({ excluded = { 2: "제외" }, deferred = false } = {}) {
   });
   vm.runInContext(source, context);
   return {
-    requests, location, events, timers, marks, result,
+    requests, location, events, timers, marks, result, markdownRequests,
+    resolveMarkdown: (response) => markdownResolve(response), panel: () => panelCallbacks,
     render: () => rendered, unmounts: () => unmounts, tick: () => tick(),
     message: (message) => new Promise((resolve) => listener(message, {}, resolve)),
     external: (patch) => { saved = { ...saved, ...patch }; subscribe(patch); },
@@ -175,6 +182,50 @@ module.exports = async function runContentTests() {
     link.href = core.addTagToUrl(href, { id: 3, name: "보통 태그" });
     env.events.click(event("click"));
     assert.equal(stopped, 3);
+  });
+  await test("할인 응답 전 목록 표시·필터와 정렬은 페이지 나누기 전 적용", async () => {
+    const env = setup({ withMarkdown: true });
+    await flush();
+    assert.equal(env.render().filtered.kept.length, 42);
+    assert.equal(env.markdownRequests.length, 1);
+    const data = { events: {
+      old: { name: "지난 행사", start: "2000-01-01", end: "2000-01-31", ongoing: false },
+      now: { name: "이번 행사", start: "2001-01-01", end: "2099-12-31", ongoing: true },
+    }, genres: { "bl-novel": { fetchedAt: Date.now(), recommended: { now: [40] }, byBook: {
+      4: { old: [50, 100], now: [30, 100] }, 40: { old: [30, 100], now: [50, 100] }, 41: { now: [60, 100] },
+    } } } };
+    env.resolveMarkdown({ ok: true, data });
+    await flush();
+    assert.equal(env.render().markdownByBook[40].label.text, "행사 30→50% · 최대");
+    assert.equal(env.render().markdownByBook[40].recommended, true);
+    await env.panel().onSortChange("delta");
+    assert.deepEqual(Array.from(env.render().paged.pageItems.slice(0, 2), (item) => item.bookShell.book.id), [40, 4]);
+    await env.panel().onSortChange("current");
+    assert.equal(env.render().paged.pageItems[0].bookShell.book.id, 41);
+    await env.panel().onFilterChange(true);
+    assert.deepEqual(Array.from(env.render().paged.pageItems, (item) => item.bookShell.book.id), [41, 40]);
+    assert.equal(env.render().beforeMarkdown, 42);
+    assert.equal((await env.message({ type: "GET_STATE" })).summary.kept, 2);
+    await env.panel().onToggleMarkdown(false);
+    assert.equal(env.render().filtered.kept.length, 42);
+    assert.equal(Object.keys(env.render().markdownByBook).length, 0);
+    assert.equal(env.requests.length, 1);
+  });
+  await test("제외 태그 없이 할인 목록 사용·이어 받기 중 기존 결과 유지", async () => {
+    const env = setup({ excluded: {}, deferred: true, withMarkdown: true });
+    await flush();
+    env.requests[0].resolve({ ...env.result, total: 12802, truncated: true, loadedPages: 15 });
+    await flush();
+    assert.equal(env.render().filtered.kept.length, 45);
+    env.render().onMore();
+    assert.equal(env.requests[1].options.maxPages, 30);
+    assert.equal(env.render().collecting, true);
+    assert.equal(env.render().filtered.kept.length, 45);
+    env.render().onMore();
+    assert.equal(env.requests.length, 2);
+    env.requests[1].resolve({ ...env.result, total: 12802, truncated: true, loadedPages: 30 });
+    await flush();
+    assert.equal(env.render().collecting, false);
   });
   return passed;
 };

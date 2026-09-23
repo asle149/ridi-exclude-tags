@@ -1,5 +1,6 @@
 (function () {
-  const defaults = { excludedTagMap: {}, excludeModeOn: false, helperEnabled: true };
+  const defaults = { excludedTagMap: {}, excludeModeOn: false, helperEnabled: true,
+    markdownEnabled: true, markdownFilterMax: false, resultSort: "ridi", panelState: {} };
   let writes = Promise.resolve();
 
   function read() {

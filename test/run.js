@@ -102,7 +102,11 @@ test("태그 삭제는 나머지 조건을 보존하고 page=1", () => {
 
 runApiTests().then(async (count) => {
   const contentCount = await runContentTests();
-  console.log(`전체 ${passed + count + contentCount}개 테스트 통과 (순수 함수 ${passed}개, 수집 ${count}개, 연결 동작 ${contentCount}개)`);
+  const markdownCount = require("./markdown.js")();
+  const panelCount = require("./panel.js")();
+  const viewCount = require("./view.js")();
+  const backgroundCount = await require("./background.js")();
+  console.log(`전체 ${passed + count + contentCount + markdownCount + panelCount + backgroundCount + viewCount}개 테스트 통과 (순수 함수 ${passed}개, 수집 ${count}개, 연결 동작 ${contentCount}개, 할인 ${markdownCount}개, 패널 ${panelCount}개, 백그라운드 ${backgroundCount}개, 카드 ${viewCount}개)`);
 }).catch((error) => {
   console.error(error);
   process.exitCode = 1;

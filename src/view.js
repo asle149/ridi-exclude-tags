@@ -45,6 +45,25 @@
     return null;
   }
 
+  function findCountHeading(mainEl) {
+    // "1,370개의 작품" 같은 리디 머리글. 텍스트 노드만 훑어 가볍게 찾는다.
+    const pattern = /^[\d,]+개의 작품$/;
+    const matches = (node) => pattern.test((node.textContent || "").trim());
+    if (typeof document.createTreeWalker !== "function") {
+      const leaves = [...mainEl.querySelectorAll("*")].filter((node) => !node.children.length && matches(node) && !node.closest(".rh-results"));
+      return leaves[0] || null;
+    }
+    const walker = document.createTreeWalker(mainEl, 4 /* SHOW_TEXT */);
+    for (let text = walker.nextNode(); text; text = walker.nextNode()) {
+      if (!/개의 작품/.test(text.nodeValue)) continue;
+      let node = text.parentElement;
+      if (!node || node.closest(".rh-results")) continue;
+      while (node.parentElement && node.parentElement !== mainEl && matches(node.parentElement)) node = node.parentElement;
+      if (matches(node)) return node;
+    }
+    return null;
+  }
+
   function hide(node) {
     if (!node) return;
     if (!hiddenElements.has(node)) hiddenElements.set(node, node.hasAttribute("hidden"));
@@ -65,6 +84,7 @@
     }
     hide(list);
     hide(pagination);
+    hide(findCountHeading(mainEl));
     return section;
   }
 
@@ -103,7 +123,7 @@
     return link;
   }
 
-  function card(item, href) {
+  function card(item, href, includedIds, markdownByBook) {
     const shell = item.bookShell || {};
     const book = shell.book || {};
     const row = element("li", "rh-card");
@@ -124,13 +144,24 @@
     const rating = core.ratingSummary(book.ratings);
     if (rating.count) info.append(element("p", "rh-rating", `★ ${rating.average.toFixed(1)} (${format(rating.count)})`));
     const badges = element("div", "rh-badges");
-    if (book.set?.totalCount) badges.append(element("span", "rh-badge", `${book.set.totalCount}권 세트`));
+    const seen = new Set();
+    const setText = book.set?.totalCount ? `${book.set.totalCount}권 세트` : (shell.badges || []).find((badge) => /^\d+권 세트$/.test(badge.text))?.text;
+    if (setText) { badges.append(element("span", "rh-badge", setText)); seen.add(setText); }
+    const markdown = markdownByBook?.[book.id];
+    if (markdown?.recommended) {
+      const badge = element("span", "rh-badge", "찜 추천");
+      badge.title = "노벨캘린더 찜 기반 추천 목록에 있는 작품";
+      badges.append(badge);
+      seen.add("찜 추천");
+    }
     for (const badge of shell.badges || []) {
-      if (badge.type === "DISCOUNT") badges.append(element("span", "rh-badge", badge.text));
+      if (badge.type === "DISCOUNT" || !badge.text || seen.has(badge.text)) continue;
+      badges.append(element("span", "rh-badge", badge.text));
+      seen.add(badge.text);
     }
     info.append(badges);
     const price = book.priceInfo?.purchase;
-    if (price && price.sellingPrice != null) {
+    if (price && price.sellingPrice > 0) {
       const line = element("p", "rh-price");
       if (price.discountRate > 0) {
         if (price.fullPrice != null) line.append(element("del", "rh-meta", `${format(price.fullPrice)}원`));
@@ -139,8 +170,17 @@
       line.append(element("strong", "", `${format(price.sellingPrice)}원`));
       info.append(line);
     }
+    if (markdown?.label) {
+      const { text, strong, title } = markdown.label;
+      const line = element("p", "rh-markdown");
+      line.title = title;
+      const index = text.indexOf(strong);
+      line.append(document.createTextNode(text.slice(0, index)), element("strong", "", strong), document.createTextNode(text.slice(index + strong.length)));
+      info.append(line);
+    }
     const tags = element("div", "rh-tags");
     for (const tag of item.tags || []) {
+      if (includedIds.has(Number(tag.id))) continue;
       const chip = element("a", "rh-tag", `#${tag.name || tag.id}`);
       chip.href = core.addTagToUrl(href, tag);
       tags.append(chip);
@@ -174,10 +214,18 @@
     return nav;
   }
 
-  function render({ filtered, total, truncated, paged, excluded, href, onPage }) {
+  function render({ filtered, total, truncated, loadedPages, paged, excluded, href, onPage, onMore, collecting, progressText, beforeMarkdown, markdownByBook }) {
     if (!section) return;
     const header = element("div", "rh-heading");
-    header.append(element("p", "rh-count", `제외 반영 ${format(filtered.kept.length)}개 · 전체 ${format(total)}개 중 ${format(filtered.removedCount)}개 제외${truncated ? " (상위 3,000개까지만 걸렀어요)" : ""}`));
+    header.append(element("p", "rh-count", `제외 반영 ${format(filtered.kept.length)}개 · 전체 ${format(total)}개 중 ${format(filtered.removedCount)}개 제외${beforeMarkdown != null ? ` (필터 전 ${format(beforeMarkdown)}개)` : ""}${truncated ? ` (상위 ${format(loadedPages * 200)}개 수집)` : ""}`));
+    if (truncated && loadedPages < 75) {
+      const more = element("button", "rh-more", collecting ? progressText || "모으는 중…" : "더 불러오기 (+3,000)");
+      more.type = "button";
+      more.disabled = !!collecting;
+      more.addEventListener("click", onMore);
+      header.append(more);
+    }
+    if (truncated && loadedPages >= 75) header.append(element("p", "rh-note", "최대 15,000개까지 모았어요."));
     if (filtered.ignoredExcluded.length) {
       header.append(element("p", "rh-note", `포함 조건과 겹치는 제외 태그는 무시했어요: ${filtered.ignoredExcluded.map((id) => `#${excluded[id] || id}`).join(", ")}`));
     }
@@ -189,7 +237,8 @@
       return;
     }
     const list = element("ul", "rh-list");
-    for (const item of paged.pageItems) list.append(card(item, href));
+    const includedIds = new Set(core.parseFinderUrl(href).tags.map((tag) => tag.id));
+    for (const item of paged.pageItems) list.append(card(item, href, includedIds, markdownByBook));
     section.append(list, pagination(paged.page, paged.totalPages, onPage));
   }
 

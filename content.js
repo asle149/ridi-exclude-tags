@@ -1,6 +1,7 @@
 (function () {
-  const { core, store, api, view } = window.RidiHelper;
-  let state = { excludedTagMap: {}, excludeModeOn: false, helperEnabled: true };
+  const { core, store, api, view, markdown, panel } = window.RidiHelper;
+  let state = { excludedTagMap: {}, excludeModeOn: false, helperEnabled: true,
+    markdownEnabled: true, markdownFilterMax: false, resultSort: "ridi", panelState: {} };
   let initialized = false;
   let summary = null;
   let collecting = false;
@@ -15,6 +16,26 @@
   let observedMain = null;
   let mountedSection = null;
   let markTimer = null;
+  let maxPages = 15;
+  let collectionKey = "";
+  let markdownData = null;
+  let markdownRequested = "";
+  let markdownStatus = "";
+  let markdownGeneration = 0;
+  const remote = panel?.create({
+    onToggleEnabled: (on) => update({ helperEnabled: on }),
+    onToggleMode: (on) => update({ excludeModeOn: on }),
+    onRemoveExcluded: (id) => update((saved) => {
+      const map = { ...saved.excludedTagMap };
+      delete map[id];
+      return { excludedTagMap: map };
+    }),
+    onClearExcluded: () => update({ excludedTagMap: {} }),
+    onToggleMarkdown: (on) => { markdownRequested = ""; return update({ markdownEnabled: on }); },
+    onFilterChange: (on) => changeDisplay({ markdownFilterMax: on }),
+    onSortChange: (value) => changeDisplay({ resultSort: value }),
+    onPanelStateChange: (panelState) => update({ panelState }),
+  });
   const initialParsed = core.parseFinderUrl(location.href);
   const base = readBase();
 
@@ -79,10 +100,106 @@
     view.scrollToTop();
   }
 
+  function updatePanel() {
+    const supported = !!markdown?.genreSlugsFor(core.parseFinderUrl(location.href).genrePath).length;
+    const format = (n) => Number(n).toLocaleString("ko-KR");
+    remote?.update({ ...state, visible: isFinder(location.href), summary,
+      summaryText: collecting ? statusText : summary ? `제외 반영 ${format(summary.kept)}개 · ${format(summary.removed)}개 제외` :
+        statusText || (state.helperEnabled ? "제외할 태그를 골라 주세요." : "도우미가 꺼져 있어요."),
+      markdownSupported: supported, markdownStatus: !supported ? "이 장르는 지원하지 않아요" :
+        !state.markdownEnabled ? "할인 정보가 꺼져 있어요" : markdownStatus || "목록을 표시하면 할인 정보를 받아요" });
+  }
+
+  function changeDisplay(patch) {
+    const url = new URL(location.href);
+    url.searchParams.set("page", "1");
+    history.replaceState(null, "", url.toString());
+    return update(patch);
+  }
+
+  function requestMarkdown(genrePath) {
+    if (!markdown || !state.markdownEnabled || !markdown.genreSlugsFor(genrePath).length || markdownRequested === genrePath) return;
+    markdownRequested = genrePath;
+    markdownData = null;
+    markdownStatus = "받는 중 0/1";
+    const current = ++markdownGeneration;
+    chrome.runtime.sendMessage({ type: "MARKDOWN_GET", genrePath }).then((response) => {
+      if (current !== markdownGeneration) return;
+      if (!response?.ok) throw new Error("할인 정보 수집 실패");
+      markdownData = { genrePath, data: response.data };
+      const slugs = markdown.genreSlugsFor(genrePath);
+      const time = Math.min(...slugs.map((slug) => response.data.genres[slug]?.fetchedAt || 0));
+      const date = new Date(time);
+      const day = date.toLocaleDateString("ko-KR") === new Date().toLocaleDateString("ko-KR") ? "오늘" : date.toLocaleDateString("ko-KR");
+      const events = new Set();
+      for (const slug of slugs) {
+        const genre = response.data.genres[slug];
+        for (const book of Object.values(genre?.byBook || {})) for (const event of Object.keys(book)) events.add(event);
+        for (const event of Object.keys(genre?.recommended || {})) events.add(event);
+      }
+      markdownStatus = `최근 ${events.size}개 행사 · ${day} ${date.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit", hour12: false })} 갱신${response.partial ? " · 일부 행사 제외" : ""}`;
+      if (snapshot && collected) renderResults();
+      updatePanel();
+    }).catch(() => {
+      if (current !== markdownGeneration) return;
+      markdownStatus = "할인 정보를 가져오지 못했어요";
+      updatePanel();
+    });
+    updatePanel();
+  }
+
+  function bookMarkdown(items, genrePath) {
+    const byBook = {};
+    if (!state.markdownEnabled || markdownData?.genrePath !== genrePath) return byBook;
+    const data = markdownData.data;
+    const today = new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const events = Object.fromEntries(Object.entries(data.events).map(([slug, event]) => [slug,
+      { ...event, ongoing: event.ongoing && event.start <= today && today <= event.end }]));
+    const genres = markdown.genreSlugsFor(genrePath).map((slug) => data.genres[slug]).filter(Boolean);
+    const recommended = new Set(genres.flatMap((genre) => Object.entries(genre.recommended)
+      .filter(([slug]) => events[slug]?.ongoing).flatMap(([, ids]) => ids)));
+    for (const item of items) {
+      const id = item.bookShell?.book?.id;
+      const history = Object.assign({}, ...genres.map((genre) => genre.byBook[id] || {}));
+      byBook[id] = { label: markdown.discountLabel(Object.entries(history).map(([eventSlug, values]) => ({ eventSlug, rate: values[0] })), events),
+        recommended: recommended.has(Number(id)) };
+    }
+    return byBook;
+  }
+
+  function renderResults() {
+    const parsed = core.parseFinderUrl(location.href);
+    const result = collected.result;
+    const filtered = core.filterItems(result.items, excludedIds(), new Set(parsed.tags.map((tag) => tag.id)));
+    const markdownByBook = bookMarkdown(filtered.kept, parsed.genrePath);
+    const beforeMarkdown = filtered.kept.length;
+    const markdownReady = state.markdownEnabled && markdownData?.genrePath === parsed.genrePath;
+    if (markdownReady && state.markdownFilterMax) filtered.kept = filtered.kept.filter((item) => markdownByBook[item.bookShell?.book?.id]?.label?.isMax);
+    if (markdownReady && state.resultSort !== "ridi") {
+      const field = state.resultSort === "delta" ? "delta" : "currentRate";
+      const value = (item) => markdownByBook[item.bookShell?.book?.id]?.label?.[field] ?? -Infinity;
+      filtered.kept.sort((a, b) => value(b) - value(a));
+    }
+    summary = { kept: filtered.kept.length, total: result.total, removed: filtered.removedCount,
+      perTag: filtered.perTag, ignoredExcluded: filtered.ignoredExcluded };
+    snapshot = { filtered, total: result.total, truncated: result.truncated, loadedPages: result.loadedPages,
+      paged: core.paginate(filtered.kept, parsed.page), excluded: state.excludedTagMap, href: location.href, onPage,
+      markdownByBook, beforeMarkdown: markdownReady && state.markdownFilterMax ? beforeMarkdown : null,
+      onMore() { if (!collecting && maxPages < 75) { maxPages += 15; recompute(); } }, collecting, progressText: statusText };
+    paint();
+    updatePanel();
+  }
+
   async function recompute() {
     if (!initialized) return;
+    updatePanel();
     const href = location.href;
-    const signature = JSON.stringify([href, state.helperEnabled, state.excludeModeOn, state.excludedTagMap]);
+    const parsed = core.parseFinderUrl(href);
+    const variables = core.buildVariables(parsed, parsed.genrePath === initialParsed.genrePath ? base : {});
+    const key = api.cacheKey(variables);
+    if (collectionKey !== key) { collectionKey = key; maxPages = 15; }
+    const signature = JSON.stringify([href, state.helperEnabled, state.excludeModeOn, state.excludedTagMap,
+      state.markdownEnabled, state.markdownFilterMax, state.resultSort, maxPages]);
     if (signature === lastHandled) return;
     lastHandled = signature;
     lastHref = href;
@@ -92,60 +209,67 @@
     clearTimeout(errorTimer);
     collecting = false;
     summary = null;
+    const previous = snapshot;
     snapshot = null;
     statusText = "";
     syncMain();
     markPanel();
-    const parsed = core.parseFinderUrl(href);
     const includedIds = new Set(parsed.tags.map((tag) => tag.id));
     const excluded = excludedIds();
-    if (!isFinder(href) || !state.helperEnabled || !parsed.tags.length || ![...excluded].some((id) => !includedIds.has(id))) {
+    const markdownOn = state.markdownEnabled && markdown?.genreSlugsFor(parsed.genrePath).length;
+    if (!isFinder(href) || !state.helperEnabled || !parsed.tags.length ||
+        (!markdownOn && ![...excluded].some((id) => !includedIds.has(id)))) {
       view.unmount();
       mountedSection = null;
+      updatePanel();
       return;
     }
+    requestMarkdown(parsed.genrePath);
     controller = new AbortController();
-    const variables = core.buildVariables(parsed, parsed.genrePath === initialParsed.genrePath ? base : {});
-    const key = api.cacheKey(variables);
     collecting = true;
     statusText = "검색 결과를 모으는 중… (0/1)";
+    if (previous && collected?.key === key && collected.result.truncated && collected.result.loadedPages < maxPages) {
+      snapshot = { ...previous, collecting: true, progressText: statusText };
+    }
     paint();
+    updatePanel();
     try {
-      const result = collected?.key === key ? collected.result : await api.collectAll(variables, {
-        signal: controller.signal,
+      const reusable = collected?.key === key && (!collected.result.truncated || collected.result.loadedPages >= maxPages);
+      const result = reusable ? collected.result : await api.collectAll(variables, {
+        signal: controller.signal, maxPages,
         onProgress(done, totalPages) {
           if (generation !== current) return;
           statusText = `검색 결과를 모으는 중… (${done}/${totalPages})`;
+          if (snapshot) snapshot = { ...snapshot, collecting: true, progressText: statusText };
           paint();
+          updatePanel();
         },
       });
       if (generation !== current) return;
       collected = { key, result };
-      const filtered = core.filterItems(result.items, excluded, includedIds);
-      summary = { kept: filtered.kept.length, total: result.total, removed: filtered.removedCount,
-        perTag: filtered.perTag, ignoredExcluded: filtered.ignoredExcluded };
-      snapshot = { filtered, total: result.total, truncated: result.truncated,
-        paged: core.paginate(filtered.kept, parsed.page), excluded: state.excludedTagMap, href, onPage };
+      collecting = false;
       statusText = "";
-      paint();
+      renderResults();
     } catch (error) {
       if (generation !== current || error.name === "AbortError") return;
       console.warn("[리디 검색 도우미] 결과 수집에 실패했어요", error);
       statusText = "결과를 가져오지 못했어요. 리디 원래 목록을 보여 드릴게요.";
+      snapshot = null;
       paint();
       errorTimer = setTimeout(() => {
         if (generation !== current) return;
         statusText = "";
         view.unmount();
         mountedSection = null;
+        updatePanel();
       }, 3000);
     } finally {
-      if (generation === current) collecting = false;
+      if (generation === current) { collecting = false; updatePanel(); }
     }
   }
 
   async function update(change) {
-    state = await store.update(change);
+    state = { ...state, ...await store.update(change) };
     recompute();
   }
 
@@ -174,7 +298,7 @@
   }
 
   const ready = store.read().then((saved) => {
-    state = saved;
+    state = { ...state, ...saved };
     initialized = true;
     store.subscribe((patch) => {
       state = { ...state, ...patch };
@@ -185,6 +309,13 @@
   ready.catch((error) => console.warn("[리디 검색 도우미] 설정을 읽지 못했어요", error));
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message?.type === "MARKDOWN_PROGRESS") {
+      if (message.genrePath === core.parseFinderUrl(location.href).genrePath) {
+        markdownStatus = `받는 중 ${message.done}/${message.total}`;
+        updatePanel();
+      }
+      return false;
+    }
     (async () => {
       await ready;
       if (!isFinder(location.href)) return { ok: false };
