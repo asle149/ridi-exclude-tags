@@ -105,14 +105,26 @@
     }
   }
 
-  async function collect(variables, task) {
+  function resultFor(entry, maxPages) {
+    const loadedPages = Math.min(maxPages, Math.max(1, Math.ceil(entry.total / 200)));
+    if (entry.results.has(loadedPages)) return entry.results.get(loadedPages);
+    const result = { items: entry.pages.slice(0, loadedPages).flat(), total: entry.total,
+      truncated: entry.total > loadedPages * 200, loadedPages };
+    entry.results.set(loadedPages, result);
+    return result;
+  }
+
+  async function collect(variables, task, entry, maxPages) {
     const signal = task.controller.signal;
     try {
-      const first = await requestPage(variables, 1, signal);
-      const totalPages = Math.min(15, Math.max(1, Math.ceil(first.totalItemCount / 200)));
-      const pages = [first.items];
+      if (!entry.pages[0]) {
+        const first = await requestPage(variables, 1, signal);
+        entry.pages[0] = first.items;
+        entry.total = first.totalItemCount;
+      }
+      const totalPages = Math.min(maxPages, Math.max(1, Math.ceil(entry.total / 200)));
       let nextPage = 2;
-      let done = 1;
+      let done = entry.pages.slice(0, totalPages).filter(Boolean).length;
       function progress() {
         task.progress = [done, totalPages];
         for (const subscriber of task.subscribers) subscriber.onProgress?.(done, totalPages);
@@ -122,35 +134,43 @@
         while (nextPage <= totalPages) {
           checkAbort(signal);
           const page = nextPage++;
+          if (entry.pages[page - 1]) continue;
           const data = await requestPage(variables, page, signal);
-          pages[page - 1] = data.items;
+          entry.pages[page - 1] = data.items;
           done++;
           progress();
         }
       }
       await Promise.all([worker(), worker()]);
       checkAbort(signal);
-      return { items: pages.flat().slice(0, 3000), total: first.totalItemCount, truncated: first.totalItemCount > 3000 };
+      entry.time = Date.now();
+      return resultFor(entry, maxPages);
     } catch (error) {
       task.controller.abort();
       throw error;
     }
   }
 
-  function collectAll(variablesBase, { signal, onProgress } = {}) {
+  function collectAll(variablesBase, { signal, onProgress, maxPages = 15 } = {}) {
     if (signal?.aborted) return Promise.reject(abortError());
+    maxPages = Math.min(75, Math.max(1, Math.trunc(Number(maxPages)) || 15));
     const key = cacheKey(variablesBase);
     const now = Date.now();
-    for (const [entryKey, entry] of cache) if (now - entry.time >= TTL) cache.delete(entryKey);
-    if (cache.has(key)) return Promise.resolve(cache.get(key).result);
+    for (const [entryKey, entry] of cache) if (now - entry.time >= TTL && !pending.has(entryKey)) cache.delete(entryKey);
+    let entry = cache.get(key);
+    if (!entry) {
+      entry = { time: now, pages: [], total: null, results: new Map() };
+      cache.set(key, entry);
+    }
+    const needed = Math.min(maxPages, Math.max(1, Math.ceil(entry.total / 200)));
+    if (entry.total !== null && Array.from({ length: needed }, (_, i) => entry.pages[i]).every(Boolean)) {
+      return Promise.resolve(resultFor(entry, maxPages));
+    }
     let task = pending.get(key);
     if (!task || task.controller.signal.aborted) {
       task = { controller: new AbortController(), subscribers: new Set(), progress: null };
       pending.set(key, task);
-      task.promise = collect(variablesBase, task).then((result) => {
-        cache.set(key, { time: Date.now(), result });
-        return result;
-      }).finally(() => {
+      task.promise = collect(variablesBase, task, entry, maxPages).finally(() => {
         if (pending.get(key) === task) pending.delete(key);
       });
     }
@@ -172,7 +192,12 @@
       }
       signal?.addEventListener("abort", cancel, { once: true });
       if (shared.progress) onProgress?.(...shared.progress);
-      shared.promise.then((result) => { cleanup(); resolve(result); }, (error) => { cleanup(); reject(error); });
+      shared.promise.then((result) => {
+        cleanup();
+        if (result.truncated && result.loadedPages < maxPages) {
+          resolve(collectAll(variablesBase, { signal, onProgress, maxPages }));
+        } else resolve(result);
+      }, (error) => { cleanup(); reject(error); });
     });
   }
 
