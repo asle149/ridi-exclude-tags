@@ -1,377 +1,231 @@
-console.log("[RIDI-EX] content.js loaded", location.href);
+(function () {
+  const { core, store, api, view } = window.RidiHelper;
+  let state = { excludedTagMap: {}, excludeModeOn: false, helperEnabled: true };
+  let initialized = false;
+  let summary = null;
+  let collecting = false;
+  let controller = null;
+  let generation = 0;
+  let lastHandled = "";
+  let lastHref = location.href;
+  let snapshot = null;
+  let collected = null;
+  let statusText = "";
+  let errorTimer = null;
+  let observedMain = null;
+  let mountedSection = null;
+  let markTimer = null;
+  const initialParsed = core.parseFinderUrl(location.href);
+  const base = readBase();
 
-const MODE_KEY = "excludeModeOn";      // 제외 모드 ON/OFF (클릭 가로채기 여부)
-const EXCLUDED_KEY = "excludedTagMap"; // { [id]: label }
+  function readBase() {
+    try {
+      const data = JSON.parse(document.getElementById("__NEXT_DATA__")?.textContent || "null");
+      const queries = data?.props?.pageProps?.dehydratedState?.queries || [];
+      const variables = queries.find((entry) => entry.queryKey?.[0] === "KeywordFinderBooks")?.queryKey?.[1];
+      if (variables) return { genre: variables.genre, setId: variables.setId,
+        adultOption: variables.adultOption, tagAdultOption: variables.tagAdultOption };
+    } catch (error) {
+      console.warn("[리디 검색 도우미] 초기 검색 정보를 읽지 못해 주소의 조건을 사용해요", error);
+    }
+    return {};
+  }
 
-let modeOnCache = false;
-let excludedMapCache = {};
-let excludedIdsCache = [];
+  function isFinder(href) {
+    try {
+      const url = new URL(href, location.href);
+      return url.origin === "https://ridibooks.com" && url.pathname.startsWith("/keyword-finder/");
+    } catch { return false; }
+  }
 
-function bgGet(key, defaultValue) {
-  return new Promise((resolve) => {
-    chrome.runtime.sendMessage({ type: "STORAGE_GET", key, defaultValue }, (res) => {
-      resolve(res?.ok ? res.value : defaultValue);
+  function excludedIds() {
+    return new Set(Object.keys(state.excludedTagMap).map(Number));
+  }
+
+  function markPanel() {
+    view.markPanelTags(state.helperEnabled && isFinder(location.href) ? excludedIds() : new Set());
+  }
+
+  const observer = new MutationObserver(() => {
+    clearTimeout(markTimer);
+    markTimer = setTimeout(markPanel, 200);
+  });
+
+  function syncMain() {
+    const main = document.querySelector("main");
+    if (observedMain !== main) {
+      observer.disconnect();
+      observedMain = main;
+      if (main) observer.observe(main, { childList: true, subtree: true, attributes: true, attributeFilter: ["href"] });
+      markPanel();
+    }
+    view.setMode(main, !!main && isFinder(location.href) && state.helperEnabled && state.excludeModeOn);
+    return main;
+  }
+
+  function paint() {
+    const main = syncMain();
+    if (!main || (!snapshot && !statusText)) return;
+    mountedSection = view.mount(main);
+    if (snapshot) view.render(snapshot);
+    else view.showStatus(statusText);
+  }
+
+  function onPage(page) {
+    const url = new URL(location.href);
+    url.searchParams.set("page", String(page));
+    history.replaceState(null, "", url.toString());
+    recompute();
+    view.scrollToTop();
+  }
+
+  async function recompute() {
+    if (!initialized) return;
+    const href = location.href;
+    const signature = JSON.stringify([href, state.helperEnabled, state.excludeModeOn, state.excludedTagMap]);
+    if (signature === lastHandled) return;
+    lastHandled = signature;
+    lastHref = href;
+    const current = ++generation;
+    controller?.abort();
+    controller = null;
+    clearTimeout(errorTimer);
+    collecting = false;
+    summary = null;
+    snapshot = null;
+    statusText = "";
+    syncMain();
+    markPanel();
+    const parsed = core.parseFinderUrl(href);
+    const includedIds = new Set(parsed.tags.map((tag) => tag.id));
+    const excluded = excludedIds();
+    if (!isFinder(href) || !state.helperEnabled || !parsed.tags.length || ![...excluded].some((id) => !includedIds.has(id))) {
+      view.unmount();
+      mountedSection = null;
+      return;
+    }
+    controller = new AbortController();
+    const variables = core.buildVariables(parsed, parsed.genrePath === initialParsed.genrePath ? base : {});
+    const key = api.cacheKey(variables);
+    collecting = true;
+    statusText = "검색 결과를 모으는 중… (0/1)";
+    paint();
+    try {
+      const result = collected?.key === key ? collected.result : await api.collectAll(variables, {
+        signal: controller.signal,
+        onProgress(done, totalPages) {
+          if (generation !== current) return;
+          statusText = `검색 결과를 모으는 중… (${done}/${totalPages})`;
+          paint();
+        },
+      });
+      if (generation !== current) return;
+      collected = { key, result };
+      const filtered = core.filterItems(result.items, excluded, includedIds);
+      summary = { kept: filtered.kept.length, total: result.total, removed: filtered.removedCount,
+        perTag: filtered.perTag, ignoredExcluded: filtered.ignoredExcluded };
+      snapshot = { filtered, total: result.total, truncated: result.truncated,
+        paged: core.paginate(filtered.kept, parsed.page), excluded: state.excludedTagMap, href, onPage };
+      statusText = "";
+      paint();
+    } catch (error) {
+      if (generation !== current || error.name === "AbortError") return;
+      console.warn("[리디 검색 도우미] 결과 수집에 실패했어요", error);
+      statusText = "결과를 가져오지 못했어요. 리디 원래 목록을 보여 드릴게요.";
+      paint();
+      errorTimer = setTimeout(() => {
+        if (generation !== current) return;
+        statusText = "";
+        view.unmount();
+        mountedSection = null;
+      }, 3000);
+    } finally {
+      if (generation === current) collecting = false;
+    }
+  }
+
+  async function update(change) {
+    state = await store.update(change);
+    recompute();
+  }
+
+  function intercept(event) {
+    if (!initialized || !state.helperEnabled || !state.excludeModeOn || !isFinder(location.href)) return;
+    const link = event.target?.closest?.("a");
+    if (!link || !isFinder(link.href)) return;
+    const url = new URL(link.href);
+    if (!url.searchParams.has("tag_ids") && !url.searchParams.has("tag_ids[]")) return;
+    const included = new Set(core.parseFinderUrl(location.href).tags.map((tag) => tag.id));
+    const added = core.parseFinderUrl(link.href).tags.filter((tag) => !included.has(tag.id));
+    if (!added.length) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    if (event.type !== "click") return;
+    update((saved) => {
+      const map = { ...saved.excludedTagMap };
+      for (const tag of added) map[tag.id] = tag.name || map[tag.id] || "";
+      return { excludedTagMap: map };
+    }).catch((error) => console.warn("[리디 검색 도우미] 제외 태그를 저장하지 못했어요", error));
+  }
+
+  for (const type of ["pointerdown", "mousedown", "click"]) {
+    document.addEventListener(type, intercept, { capture: true, passive: false });
+  }
+
+  const ready = store.read().then((saved) => {
+    state = saved;
+    initialized = true;
+    store.subscribe((patch) => {
+      state = { ...state, ...patch };
+      recompute();
     });
+    recompute();
   });
-}
+  ready.catch((error) => console.warn("[리디 검색 도우미] 설정을 읽지 못했어요", error));
 
-function bgSet(key, value) {
-  return new Promise((resolve) => {
-    chrome.runtime.sendMessage({ type: "STORAGE_SET", key, value }, () => resolve());
-  });
-}
-
-async function loadMode() {
-  return !!(await bgGet(MODE_KEY, false));
-}
-
-async function setMode(on) {
-  await bgSet(MODE_KEY, !!on);
-}
-
-async function loadExcludedMap() {
-  return (await bgGet(EXCLUDED_KEY, {})) || {};
-}
-
-async function saveExcludedMap(map) {
-  await bgSet(EXCLUDED_KEY, map || {});
-}
-
-async function refreshCaches() {
-  modeOnCache = await loadMode();
-  excludedMapCache = await loadExcludedMap();
-  excludedIdsCache = Object.keys(excludedMapCache).map(String);
-}
-
-function decodeSafe(s) {
-  try {
-    return decodeURIComponent(s);
-  } catch {
-    return s;
-  }
-}
-
-function extractIdLabelFromTagValue(tagValue) {
-  const m = String(tagValue).match(/^(\d+)(?:-(.*))?$/);
-  if (!m) return { id: null, label: "" };
-  return { id: m[1], label: m[2] ? decodeSafe(m[2]) : "" };
-}
-
-function getTagParams(url) {
-  const u = new URL(url);
-  const keys = ["tag_ids", "tag_ids[]"];
-  const out = [];
-  for (const key of keys) {
-    for (const v of u.searchParams.getAll(key)) out.push({ key, value: v });
-  }
-  return out;
-}
-
-function getIncludedTagsFromUrl(url) {
-  const seen = new Set();
-  const tags = [];
-  for (const { value } of getTagParams(url)) {
-    const t = extractIdLabelFromTagValue(value);
-    if (!t.id) continue;
-    const id = String(t.id);
-    if (seen.has(id)) continue;
-    seen.add(id);
-    tags.push({ id, label: t.label || "" });
-  }
-  return tags;
-}
-
-function removeExcludedFromUrl(url, excludedIds) {
-  const u = new URL(url);
-  const sp = u.searchParams;
-
-  const tags = getTagParams(url);
-  if (!tags.length) return url;
-
-  sp.delete("tag_ids");
-  sp.delete("tag_ids[]");
-
-  let changed = false;
-
-  for (const { key, value } of tags) {
-    const { id } = extractIdLabelFromTagValue(value);
-    if (id && excludedIds.includes(String(id))) {
-      changed = true;
-      continue;
-    }
-    sp.append(key, value);
-  }
-
-  if (changed) sp.set("page", "1");
-  return u.toString();
-}
-
-function isKeywordFinderUrl(href) {
-  try {
-    const u = new URL(href, location.href);
-    return u.origin === "https://ridibooks.com" && u.pathname.startsWith("/keyword-finder/");
-  } catch {
-    return false;
-  }
-}
-
-function isTagLinkHref(href) {
-  return (
-    href.includes("tag_ids=") ||
-    href.includes("tag_ids[]=") ||
-    href.includes("tag_ids%5B%5D=")
-  );
-}
-
-(function injectStyle() {
-  const css = `
-    a.ridi-excluded-tag {
-      background:rgb(112, 112, 112) !important;
-      color: #666 !important;
-      border-radius: 999px !important;
-      padding: 2px 8px !important;
-    }
-
-    li.ridi-excluded-tag-li > a,
-    li.ridi-excluded-tag-li {
-      background: #f0f0f0 !important;
-    }
-  `;
-  const style = document.createElement("style");
-  style.setAttribute("data-ridi-ex-style", "1");
-  style.textContent = css;
-  document.documentElement.appendChild(style);
-})();
-
-function isProbablyWorkCard(el) {
-  if (!el) return false;
-
-  const hasWorkLink = !!el.querySelector('a[href*="/books/"]');
-  const hasThumb = !!el.querySelector("img, picture source");
-  const hasTagLink = !!el.querySelector(
-    'a[href*="tag_ids="], a[href*="tag_ids[]="], a[href*="tag_ids%5B%5D="]'
-  );
-
-  return hasWorkLink && hasThumb && hasTagLink;
-}
-
-function findWorkCardFromTagLink(tagA) {
-  const candidates = [
-    tagA.closest("li"),
-    tagA.closest("article"),
-    tagA.closest('div[class*="card"]'),
-    tagA.closest('div[class*="item"]'),
-  ].filter(Boolean);
-
-  for (const c of candidates) {
-    if (isProbablyWorkCard(c)) return c;
-  }
-  return null;
-}
-
-function applyDomExcludeAndMark() {
-  const tagLinks = document.querySelectorAll(
-    'a[href*="tag_ids="], a[href*="tag_ids[]="], a[href*="tag_ids%5B%5D="]'
-  );
-
-  for (const a of tagLinks) {
-    const href = a.getAttribute("href") || "";
-    let abs = "";
-    try {
-      abs = new URL(href, location.href).toString();
-    } catch {
-      abs = "";
-    }
-    if (!abs) continue;
-
-    const idsInLink = getIncludedTagsFromUrl(abs).map((t) => String(t.id));
-    const hit = idsInLink.some((id) => excludedIdsCache.includes(id));
-
-    if (hit) {
-      a.classList.add("ridi-excluded-tag");
-      const li = a.closest("li");
-      if (li) li.classList.add("ridi-excluded-tag-li");
-    } else {
-      a.classList.remove("ridi-excluded-tag");
-      const li = a.closest("li");
-      if (li) li.classList.remove("ridi-excluded-tag-li");
-    }
-  }
-
-  if (!excludedIdsCache.length) return;
-
-  for (const a of tagLinks) {
-    const href = a.getAttribute("href") || "";
-    let abs = "";
-    try {
-      abs = new URL(href, location.href).toString();
-    } catch {
-      abs = "";
-    }
-    if (!abs) continue;
-
-    const idsInLink = getIncludedTagsFromUrl(abs).map((t) => String(t.id));
-    const hit = idsInLink.some((id) => excludedIdsCache.includes(id));
-    if (!hit) continue;
-
-    const card = findWorkCardFromTagLink(a);
-    if (!card) continue; 
-
-    if (card.dataset.ridiExcluded !== "1") {
-      card.dataset.ridiExcluded = "1";
-      card.style.display = "none";
-    }
-  }
-}
-
-function restoreHiddenCardsIfNeeded() {
-  const hidden = document.querySelectorAll('[data-ridi-excluded="1"]');
-  for (const el of hidden) {
-    el.style.display = "";
-    el.dataset.ridiExcluded = "";
-  }
-  applyDomExcludeAndMark();
-}
-
-const mo = new MutationObserver(() => applyDomExcludeAndMark());
-mo.observe(document.documentElement, { childList: true, subtree: true });
-
-async function addExcluded(id, label) {
-  const map = await loadExcludedMap();
-  map[String(id)] = label || map[String(id)] || "";
-  await saveExcludedMap(map);
-  excludedMapCache = map;
-  excludedIdsCache = Object.keys(map).map(String);
-}
-
-async function removeExcluded(id) {
-  const map = await loadExcludedMap();
-  delete map[String(id)];
-  await saveExcludedMap(map);
-  excludedMapCache = map;
-  excludedIdsCache = Object.keys(map).map(String);
-}
-
-async function clearExcluded() {
-  await saveExcludedMap({});
-  excludedMapCache = {};
-  excludedIdsCache = [];
-}
-
-function stopAll(e) {
-  e.preventDefault();
-  e.stopPropagation();
-  e.stopImmediatePropagation?.();
-}
-
-async function interceptEventSafe(e) {
-  if (!modeOnCache) return;
-
-  const a = e.target?.closest?.("a");
-  if (!a) return;
-
-  const href = a.getAttribute("href") || "";
-  if (!href) return;
-
-  if (!isTagLinkHref(href)) return;
-  if (!isKeywordFinderUrl(href)) return;
-
-  let abs;
-  try {
-    abs = new URL(href, location.href).toString();
-  } catch {
-    return;
-  }
-
-  const currentIds = new Set(getIncludedTagsFromUrl(location.href).map((t) => String(t.id)));
-  const nextTags = getIncludedTagsFromUrl(abs);
-  const newlyAdded = nextTags.find((t) => !currentIds.has(String(t.id)));
-
-  if (!newlyAdded) return; 
-
-  stopAll(e);
-
-  try {
-    await addExcluded(newlyAdded.id, newlyAdded.label);
-    applyDomExcludeAndMark();
-    console.log("[RIDI-EX] excluded added:", newlyAdded.id, newlyAdded.label);
-  } catch (err) {
-    console.warn("[RIDI-EX] intercept failed", err);
-  }
-}
-
-["pointerdown", "mousedown", "click"].forEach((type) => {
-  document.addEventListener(type, interceptEventSafe, { capture: true, passive: false });
-});
-
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  (async () => {
-    if (!isKeywordFinderUrl(location.href)) {
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    (async () => {
+      await ready;
+      if (!isFinder(location.href)) return { ok: false };
+      switch (message?.type) {
+        case "GET_STATE":
+          recompute();
+          return { ok: true, helperEnabled: state.helperEnabled, modeOn: state.excludeModeOn,
+            included: core.parseFinderUrl(location.href).tags, excluded: state.excludedTagMap, summary, collecting };
+        case "SET_MODE":
+          await update({ excludeModeOn: !!message.on });
+          break;
+        case "SET_ENABLED":
+          await update({ helperEnabled: !!message.on });
+          break;
+        case "REMOVE_EXCLUDED":
+          await update((saved) => {
+            const map = { ...saved.excludedTagMap };
+            delete map[String(message.id)];
+            return { excludedTagMap: map };
+          });
+          break;
+        case "CLEAR_EXCLUDED":
+          await update({ excludedTagMap: {} });
+          break;
+        default: return { ok: false };
+      }
+      return { ok: true };
+    })().then(sendResponse, (error) => {
+      console.warn("[리디 검색 도우미] 설정을 변경하지 못했어요", error);
       sendResponse({ ok: false });
-      return;
-    }
+    });
+    return true;
+  });
 
-    if (msg?.type === "GET_STATE") {
-      const modeOn = await loadMode();
-      const excluded = await loadExcludedMap();
-      const included = getIncludedTagsFromUrl(location.href);
-      sendResponse({ ok: true, modeOn, excluded, included });
-      return;
-    }
-
-    if (msg?.type === "SET_MODE") {
-      await setMode(!!msg.on);
-      modeOnCache = !!msg.on;
-      sendResponse({ ok: true });
-      return;
-    }
-
-    if (msg?.type === "REMOVE_EXCLUDED") {
-      await removeExcluded(String(msg.id));
-      restoreHiddenCardsIfNeeded();
-      sendResponse({ ok: true });
-      return;
-    }
-
-    if (msg?.type === "CLEAR_EXCLUDED") {
-      await clearExcluded();
-      restoreHiddenCardsIfNeeded();
-
-      document.querySelectorAll("a.ridi-excluded-tag").forEach((a) => a.classList.remove("ridi-excluded-tag"));
-      document.querySelectorAll("li.ridi-excluded-tag-li").forEach((li) => li.classList.remove("ridi-excluded-tag-li"));
-
-      sendResponse({ ok: true });
-      return;
-    }
-
-    if (msg?.type === "APPLY_EXCLUDED_NOW") {
-      await refreshCaches();
-      const cleaned = removeExcludedFromUrl(location.href, excludedIdsCache);
-      if (cleaned !== location.href) location.replace(cleaned);
-      sendResponse({ ok: true });
-      return;
-    }
-
-    sendResponse({ ok: false });
-  })();
-
-  return true;
-});
-
-(async () => {
-  await refreshCaches();
-  applyDomExcludeAndMark();
+  window.addEventListener("popstate", () => recompute());
+  setInterval(() => {
+    if (!initialized) return;
+    if (lastHref !== location.href) recompute();
+    const main = syncMain();
+    if (!main || (!snapshot && !statusText)) return;
+    const section = view.mount(main);
+    if (section !== mountedSection) paint();
+  }, 300);
 })();
-
-chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== "local") return;
-
-  if (changes[MODE_KEY]) {
-    modeOnCache = !!changes[MODE_KEY].newValue;
-  }
-  if (changes[EXCLUDED_KEY]) {
-    excludedMapCache = changes[EXCLUDED_KEY].newValue || {};
-    excludedIdsCache = Object.keys(excludedMapCache).map(String);
-    restoreHiddenCardsIfNeeded();
-  }
-});
